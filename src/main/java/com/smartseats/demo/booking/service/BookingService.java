@@ -14,9 +14,11 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.LockModeType;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import com.smartseats.demo.notification.service.EmailService;
+import com.smartseats.demo.user.entity.User;
+import com.smartseats.demo.user.repository.UserRepository;
 
 import java.math.BigDecimal;
-import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -28,17 +30,26 @@ public class BookingService {
     private final EventRepository eventRepository;
     private final SeatCategoryRepository seatCategoryRepository;
     private final EntityManager entityManager;
+    private final SeatReservationService seatReservationService;
+    private final UserRepository userRepository;
+    private final EmailService emailService;
 
     public BookingService(BookingRepository bookingRepository,
                           EventRepository eventRepository,
                           SeatCategoryRepository seatCategoryRepository,
-                          EntityManager entityManager) {
+                          EntityManager entityManager,
+                          SeatReservationService seatReservationService,
+                          UserRepository userRepository,
+                          EmailService emailService) {
         this.bookingRepository = bookingRepository;
         this.eventRepository = eventRepository;
         this.seatCategoryRepository = seatCategoryRepository;
         this.entityManager = entityManager;
+        this.seatReservationService = seatReservationService;
+        this.userRepository = userRepository;
+        this.emailService = emailService;
     }
-
+    
     @Transactional
     public BookingResponse createBooking(BookingRequest request, Long userId) {
 
@@ -50,49 +61,89 @@ public class BookingService {
             throw new RuntimeException("Event is not available for booking");
         }
 
-        // Step 2 — Lock the seat category row to prevent double booking
-        // PESSIMISTIC_WRITE locks the DB row so no other transaction
-        // can modify it until this transaction completes
-        SeatCategory seatCategory = entityManager.find(
-                SeatCategory.class,
+        // Step 2 — Try to hold seats in Redis first
+        // This is the fast check before hitting the database
+        boolean held = seatReservationService.holdSeats(
+                request.getEventId(),
                 request.getSeatCategoryId(),
-                LockModeType.PESSIMISTIC_WRITE
+                userId,
+                request.getNumberOfSeats()
         );
 
-        if (seatCategory == null) {
-            throw new RuntimeException("Seat category not found");
+        if (!held) {
+            throw new RuntimeException(
+                "You already have a seat reservation in progress. " +
+                "Please complete or wait for it to expire."
+            );
         }
 
-        // Step 3 — Check available seats
-        if (seatCategory.getAvailableSeats() < request.getNumberOfSeats()) {
-            throw new RuntimeException("Not enough seats available. Only "
-                    + seatCategory.getAvailableSeats() + " seats left");
+        try {
+            // Step 3 — Lock the seat category row in DB
+            SeatCategory seatCategory = entityManager.find(
+                    SeatCategory.class,
+                    request.getSeatCategoryId(),
+                    LockModeType.PESSIMISTIC_WRITE
+            );
+
+            if (seatCategory == null) {
+                throw new RuntimeException("Seat category not found");
+            }
+
+            // Step 4 — Check available seats
+            if (seatCategory.getAvailableSeats() < request.getNumberOfSeats()) {
+                throw new RuntimeException("Not enough seats available. Only "
+                        + seatCategory.getAvailableSeats() + " seats left");
+            }
+
+            // Step 5 — Reduce available seats
+            seatCategory.setAvailableSeats(
+                    seatCategory.getAvailableSeats() - request.getNumberOfSeats()
+            );
+            entityManager.merge(seatCategory);
+
+            // Step 6 — Calculate total
+            BigDecimal totalAmount = seatCategory.getPrice()
+                    .multiply(BigDecimal.valueOf(request.getNumberOfSeats()));
+
+            // Step 7 — Create booking
+            Booking booking = new Booking();
+            booking.setUserId(userId);
+            booking.setEventId(request.getEventId());
+            booking.setSeatCategoryId(request.getSeatCategoryId());
+            booking.setSeatCategoryName(seatCategory.getName());
+            booking.setNumberOfSeats(request.getNumberOfSeats());
+            booking.setPricePerSeat(seatCategory.getPrice());
+            booking.setTotalAmount(totalAmount);
+            booking.setStatus(BookingStatus.CONFIRMED);
+            booking.setBookingReference("SS-" + UUID.randomUUID()
+                    .toString().substring(0, 8).toUpperCase());
+
+            booking = bookingRepository.save(booking);
+
+            // Send confirmation email
+            User user = userRepository.findById(userId).orElse(null);
+            if (user != null) {
+                emailService.sendBookingConfirmation(
+                        user.getEmail(),
+                        user.getName(),
+                        booking.getBookingReference(),
+                        event.getName(),
+                        booking.getNumberOfSeats(),
+                        booking.getTotalAmount().toString()
+                );
+            }
+
+            return toResponse(booking);
+
+        } catch (RuntimeException e) {
+            // If anything goes wrong, release the Redis hold
+            seatReservationService.releaseHold(
+                    request.getEventId(),
+                    request.getSeatCategoryId(),
+                    userId
+            );
+            throw e;
         }
-
-        // Step 4 — Reduce available seats
-        seatCategory.setAvailableSeats(
-                seatCategory.getAvailableSeats() - request.getNumberOfSeats()
-        );
-        entityManager.merge(seatCategory);
-
-        // Step 5 — Calculate total amount
-        BigDecimal totalAmount = seatCategory.getPrice()
-                .multiply(BigDecimal.valueOf(request.getNumberOfSeats()));
-
-        // Step 6 — Create booking with unique reference
-        Booking booking = new Booking();
-        booking.setUserId(userId);
-        booking.setEventId(request.getEventId());
-        booking.setSeatCategoryId(request.getSeatCategoryId());
-        booking.setSeatCategoryName(seatCategory.getName());
-        booking.setNumberOfSeats(request.getNumberOfSeats());
-        booking.setPricePerSeat(seatCategory.getPrice());
-        booking.setTotalAmount(totalAmount);
-        booking.setStatus(BookingStatus.CONFIRMED);
-        booking.setBookingReference("SS-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase());
-
-        booking = bookingRepository.save(booking);
-        return toResponse(booking);
     }
 
     public BookingResponse getBooking(Long id, Long userId) {
@@ -126,7 +177,7 @@ public class BookingService {
             throw new RuntimeException("Booking is already cancelled");
         }
 
-        // Restore the seats back
+        // Restore seats in DB
         SeatCategory seatCategory = entityManager.find(
                 SeatCategory.class,
                 booking.getSeatCategoryId(),
@@ -140,8 +191,26 @@ public class BookingService {
             entityManager.merge(seatCategory);
         }
 
+        // Release Redis hold
+        seatReservationService.releaseHold(
+                booking.getEventId(),
+                booking.getSeatCategoryId(),
+                userId
+        );
+
         booking.setStatus(BookingStatus.CANCELLED);
         booking = bookingRepository.save(booking);
+
+        // Send cancellation email
+        User user = userRepository.findById(userId).orElse(null);
+        if (user != null) {
+            emailService.sendCancellationEmail(
+                    user.getEmail(),
+                    user.getName(),
+                    booking.getBookingReference()
+            );
+        }
+
         return toResponse(booking);
     }
 
